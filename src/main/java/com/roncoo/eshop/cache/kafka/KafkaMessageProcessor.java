@@ -5,8 +5,14 @@ import com.roncoo.eshop.cache.model.ProductInfo;
 import com.roncoo.eshop.cache.model.ShopInfo;
 import com.roncoo.eshop.cache.service.CacheService;
 import com.roncoo.eshop.cache.spring.SpringContext;
+import com.roncoo.eshop.cache.zk.ZookeeperSession;
 import kafka.consumer.ConsumerIterator;
 import kafka.consumer.KafkaStream;
+
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.Objects;
 
 /**
  * kafka消息处理线程
@@ -64,11 +70,48 @@ public class KafkaMessageProcessor implements Runnable {
 
 		// 缓存架构：高并发、高性能、海量数据，等场景
 
-		String productInfoJSON = "{\"id\": 1, \"name\": \"iphone7手机\", \"price\": 5599, \"pictureList\":\"a.jpg,b.jpg\", \"specification\": \"iphone7的规格\", \"service\": \"iphone7的售后服务\", \"color\": \"红色,白色,黑色\", \"size\": \"5.5\", \"shopId\": 1}";
+		String productInfoJSON = "{\"id\": 2, \"name\": \"iphone7手机\", \"price\": 5599, \"pictureList\":\"a.jpg,b.jpg\", \"specification\": \"iphone7的规格\", \"service\": \"iphone7的售后服务\", \"color\": \"红色,白色,黑色\", \"size\": \"5.5\", \"shopId\": 1," +
+				"\"modified_time\":\"2017-01-01 12:00:00\"}";
 		ProductInfo productInfo = JSONObject.parseObject(productInfoJSON, ProductInfo.class);
+
+
 		cacheService.saveProductInfo2LocalCache(productInfo);
 		System.out.println("===================获取刚保存到本地缓存的商品信息：" + cacheService.getProductInfoFromLocalCache(productId));
-		cacheService.saveProductInfo2ReidsCache(productInfo);
+		//将数据直接写入redis缓存之前应该获取一个zk分布式锁
+		ZookeeperSession zkSession = ZookeeperSession.getInstance();
+		zkSession.acquireDistributeLock(productId);
+		try {
+			//获取到了锁，先从redis获取数据
+			ProductInfo nowProduct = cacheService.getProductInfoFromReidsCache(productId);
+			if(Objects.nonNull(nowProduct)){
+				SimpleDateFormat simpleDateFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+				try {
+					Date date = simpleDateFormat.parse(productInfo.getModifiedTime());
+					Date existDate = simpleDateFormat.parse(nowProduct.getModifiedTime());
+					if(date.before(existDate)){
+						System.out.println("product time before existDate,product time:"+ productInfo.getModifiedTime()
+								+";existDate:"+ nowProduct.getModifiedTime());
+						cacheService.saveProductInfo2LocalCache(nowProduct);
+						return;
+					}
+				} catch (ParseException e) {
+					e.printStackTrace();
+				}
+				System.out.println("product time after existDate,product time:"+ productInfo.getModifiedTime()
+						+";existDate:"+ nowProduct.getModifiedTime());
+			}else {
+				System.out.println("product not exit");
+			}
+			cacheService.saveProductInfo2ReidsCache(productInfo);
+			//保持zookeeper锁
+			try {
+				Thread.sleep(200000);
+			} catch (InterruptedException e) {
+				e.printStackTrace();
+			}
+		}finally {
+			zkSession.releaseDistributeLock(productId);
+		}
 	}
 
 	/**
